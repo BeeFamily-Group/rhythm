@@ -1,0 +1,549 @@
+// Dallo stato della web app e da meta.json ai dati che la pagina disegna.
+import {
+  activeWindow, elapsedActiveDays, expectedToDate, pacing, perDayToClose, kpis7, googleStale, alertValues, closeSuggestion,
+} from './calc.js';
+
+export function channelLabel(title) {
+  const t = String(title).toUpperCase();
+  const base = t.includes('FACEBOOK') ? 'Meta' : t.includes('CHATGPT') ? 'ChatGPT' : t.includes('TIKTOK') ? 'TikTok' : 'Google';
+  if (t.includes('ITALIA')) return `${base} Italia`;
+  if (t.includes('ESTERO')) return `${base} estero`;
+  if (t.includes('GAS')) return `${base} GAS`;
+  if (t.includes('VILLE')) return `${base} ville`;
+  if (t.includes('BARCA')) return `${base} barca`;
+  return base;
+}
+
+export function stateLabel(state, pct) {
+  if (state === 'ok') return 'in linea';
+  if (state === 'nodata') return 'numeri da inserire';
+  if (state === 'notyet') return 'non ancora iniziato';
+  if (state === 'early') return 'spesa prima dei giorni attivi';
+  if (state === 'under') return `sotto −${Math.abs(pct)}%`;
+  if (state === 'over') return pct === null ? 'spesa senza budget' : `sopra +${pct}%`;
+  return 'nessun budget';
+}
+
+// Dati dei canali esterni a Meta: Google dal tab GOOGLE (Marco/script), ChatGPT e TikTok dai loro tab (routine notturna).
+const extRows = (state, ch) => ({ chatgpt: state.chatgpt, tiktok: state.tiktok }[ch.kind] || state.google) || [];
+
+const RANK = { over: 3, early: 3, under: 2, ok: 1, nodata: 0.6, notyet: 0.5, none: 0 };
+const round2 = (n) => Math.round(n * 100) / 100;
+
+// Una riga MAPPA vale per il canale se ha il suo id e, quando c'è, lo stesso titolo del blocco (righe vecchie senza titolo: valgono).
+function rowMatches(r, ch) {
+  const id = typeof ch === 'string' ? ch : ch.id;
+  const title = typeof ch === 'string' ? null : ch.title;
+  return r.channel_id === id && (!r.channel_title || !title || r.channel_title === title);
+}
+
+function mappedIds(mapping, ch) {
+  return new Set(mapping.filter(r => rowMatches(r, ch)).map(r => String(r.campaign_id)));
+}
+
+export function metaSpent(meta, mapping, ch, ym, asOf) {
+  const ids = mappedIds(mapping, ch);
+  const byDate = new Map();
+  for (const r of meta.daily) {
+    if (!ids.has(String(r.campaign_id)) || !r.date.startsWith(ym) || r.date > asOf) continue;
+    const cur = byDate.get(r.date) || { date: r.date, spend: 0, leads: 0 };
+    cur.spend = round2(cur.spend + r.spend);
+    cur.leads += r.leads;
+    byDate.set(r.date, cur);
+  }
+  const daily = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const active = meta.campaigns.filter(c => ids.has(String(c.id)) && c.status === 'ACTIVE');
+  return {
+    spent: round2(daily.reduce((s, d) => s + d.spend, 0)),
+    dailyBudget: round2(active.reduce((s, c) => s + (c.daily_budget || 0), 0)),
+    activeCampaigns: active.length,
+    daily,
+  };
+}
+
+function latestGoogle(google, channelId, ym) {
+  return google
+    .filter(g => g.channel_id === channelId && String(g.date).startsWith(ym))
+    .sort((a, b) => (String(a.date) + a.ts).localeCompare(String(b.date) + b.ts))
+    .pop() || null;
+}
+
+function staleSince(meta, mapping, ch) {
+  const ids = mappedIds(mapping, ch);
+  const accs = new Set(meta.campaigns.filter(c => ids.has(String(c.id))).map(c => c.account_id));
+  const dates = [...accs].map(a => meta.accounts[a]).filter(a => a && !a.ok).map(a => a.last_ok || 'mai');
+  if (!dates.length) return null;
+  return dates.includes('mai') ? 'mai' : dates.sort()[0];
+}
+
+// Testo per un canale o un account con i dati Meta fermi: 'mai' (o null) = mai letto.
+export function staleText(since) {
+  return !since || since === 'mai' ? 'mai letti' : `fermi al ${ddmm(since)}`;
+}
+
+// Mac spento: di quanti giorni i dati Meta sono indietro rispetto a ieri (0 = in orario, null = nessun dato).
+export function macLate(asOf, today) {
+  if (!asOf) return null;
+  const day = 86400000;
+  const late = Math.round((Date.parse(today) - day - Date.parse(asOf)) / day);
+  return late > 0 ? late : 0;
+}
+
+// Ricerca: senza accenti e maiuscole, tutte le parole cercate in qualsiasi ordine.
+const fold = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+// Nome reale e località della struttura (data/strutture.json); senza voce resta il nome del tab dello Sheet.
+export function structureName(names, tab) {
+  const n = names && names[tab];
+  return { name: (n && n.name) || tab, place: (n && n.place) || '' };
+}
+
+export function matchQuery(name, q) {
+  const n = fold(name);
+  return fold(q).split(/\s+/).filter(Boolean).every(w => n.includes(w));
+}
+
+// Spesa e lead Meta giorno per giorno delle strutture indicate (campagne assegnate), fino ad asOf, giorni vuoti a zero.
+export function trendDaily(state, meta, tabs, asOf) {
+  const want = new Set(tabs);
+  const ids = new Set();
+  for (const s of state.structures) {
+    if (!want.has(s.tab)) continue;
+    for (const ch of s.channels) if (ch.kind === 'meta') mappedIds(state.mapping, ch).forEach(id => ids.add(id));
+  }
+  const by = new Map();
+  for (const r of meta.daily || []) {
+    if (!ids.has(String(r.campaign_id)) || r.date > asOf) continue;
+    const x = by.get(r.date) || { spend: 0, leads: 0 };
+    x.spend += r.spend; x.leads += r.leads;
+    by.set(r.date, x);
+  }
+  if (!by.size) return [];
+  const out = [];
+  const day = 86400000;
+  for (let t = Date.parse(`${[...by.keys()].sort()[0]}T00:00:00Z`); t <= Date.parse(`${asOf}T00:00:00Z`); t += day) {
+    const date = new Date(t).toISOString().slice(0, 10);
+    const x = by.get(date) || { spend: 0, leads: 0 };
+    out.push({ date, spend: round2(x.spend), leads: x.leads });
+  }
+  return out;
+}
+
+function withOverrides(state, ch) {
+  return ch.months.map(m => {
+    const o = state.days.find(d => d.channel_id === ch.id && d.ym === m.ym);
+    return { ...m, start_day: o ? Number(o.start_day) : null };
+  });
+}
+
+export function channelView(state, meta, ch, ym, asOf, today = asOf) {
+  const months = withOverrides(state, ch);
+  const i = months.findIndex(m => m.ym === ym);
+  if (i === -1) return null;
+  const m = months[i];
+  const win = activeWindow(months, i);
+  const programmed = (m.eur || 0) * (m.days || 0);
+  let spent = 0;
+  let spentAsOf = asOf;
+  let extra;
+  let g = null;
+  if (ch.kind === 'meta') {
+    const s = metaSpent(meta, state.mapping, ch, ym, asOf);
+    spent = s.spent;
+    extra = { dailyBudget: s.dailyBudget, activeCampaigns: s.activeCampaigns, daily: s.daily,
+              updatedOn: null, stale: false, dataStaleSince: staleSince(meta, state.mapping, ch) };
+  } else {
+    g = latestGoogle(extRows(state, ch), ch.id, ym);
+    spent = g ? Number(g.spent_mtd) : 0;
+    spentAsOf = g ? String(g.date) : null;
+    extra = { dailyBudget: g ? Number(g.daily_budget) : null, activeCampaigns: g ? (g.active ? 1 : 0) : null,
+              leadsMtd: g ? Number(g.leads_mtd) : null, daily: [], updatedOn: g ? String(g.date) : null,
+              stale: googleStale(g && String(g.date), today), dataStaleSince: null };
+  }
+  const elapsed = spentAsOf ? elapsedActiveDays(win, ym, spentAsOf) : 0;
+  const expected = expectedToDate(programmed, elapsed, win.days);
+  let pace;
+  if (programmed === 0 && spent === 0) pace = { state: 'none', pct: null };
+  else if (ch.kind !== 'meta' && !g && programmed > 0 && ym <= today.slice(0, 7)) pace = { state: 'nodata', pct: null };
+  else if (programmed > 0 && !(expected > 0)) pace = { state: spent > 0 ? 'early' : 'notyet', pct: null };
+  else pace = pacing(spent, expected);
+  // Spesa Effettiva dello Sheet diversa da quella calcolata (inserita a mano, per esempio dalle fatture)
+  const sheet = m.sheet_spent;
+  const sheetMismatch = sheet !== null && sheet !== undefined && ym <= today.slice(0, 7)
+    && Math.abs(sheet - spent) > Math.max(5, spent * 0.02) ? sheet : null;
+  return {
+    id: ch.id, kind: ch.kind, title: ch.title, eur: m.eur, days: m.days, proposal: m.proposal, win,
+    programmed, spent, expected, state: pace.state, pct: pace.pct, sheetMismatch,
+    perDay: perDayToClose(programmed, spent, win.days - elapsed), remaining: win.days - elapsed,
+    ...extra,
+  };
+}
+
+export function buildCards(state, meta, ym, asOf, today = asOf, names = null) {
+  return state.structures.map(s => {
+    const channels = s.channels.map(ch => channelView(state, meta, ch, ym, asOf, today)).filter(Boolean);
+    // I 7 giorni guardano anche a fine mese precedente: si usa il giornaliero completo, non solo il mese scelto.
+    const allDaily = new Map();
+    for (const ch of s.channels.filter(c => c.kind === 'meta')) {
+      const ids = mappedIds(state.mapping, ch);
+      for (const r of meta.daily) {
+        if (!ids.has(String(r.campaign_id)) || r.date > asOf) continue;
+        const cur = allDaily.get(r.date) || { date: r.date, spend: 0, leads: 0 };
+        cur.spend = round2(cur.spend + r.spend);
+        cur.leads += r.leads;
+        allDaily.set(r.date, cur);
+      }
+    }
+    const hasMeta = s.channels.some(c => c.kind === 'meta');
+    const overall = channels.reduce((acc, c) => (RANK[c.state] > RANK[acc] ? c.state : acc), 'none');
+    // proposte in giallo da confermare nel mese scelto o in quello dopo: vanno decise prima che il mese parta
+    const soon = [ym, nextMonth(ym)];
+    const proposals = soon.filter(y => s.channels.some(ch => ch.months.some(m => m.ym === y && m.proposal)));
+    const real = structureName(names, s.tab);
+    return {
+      tab: s.tab,
+      name: real.name,
+      place: real.place,
+      overall,
+      channels,
+      proposals,
+      kpi7: hasMeta ? kpis7([...allDaily.values()], asOf) : null,
+    };
+  });
+}
+
+export function unassigned(state, meta, ym, asOf) {
+  // assegnata = la sua riga MAPPA punta a un blocco che esiste ancora con lo stesso titolo (tab rinominato o colonne spostate: no)
+  const channels = state.structures.flatMap(s => s.channels);
+  const assigned = new Set(state.mapping.filter(r => channels.some(ch => rowMatches(r, ch))).map(r => String(r.campaign_id)));
+  const spent = new Map();
+  for (const r of meta.daily) {
+    if (assigned.has(String(r.campaign_id)) || !r.date.startsWith(ym) || r.date > asOf || !(r.spend > 0)) continue;
+    spent.set(String(r.campaign_id), round2((spent.get(String(r.campaign_id)) || 0) + r.spend));
+  }
+  return [...spent.entries()].map(([id, value]) => {
+    const c = meta.campaigns.find(x => String(x.id) === id) || {};
+    return { campaign_id: id, name: c.name || id, account_id: c.account_id || '', spent: value };
+  });
+}
+
+// Data da cui applicare su Meta una modifica: oggi per il mese in corso, primo giorno attivo per un mese futuro.
+export function applyFrom(win, ym, today) {
+  const first = `${ym}-${String(win.startDay).padStart(2, '0')}`;
+  if (ym === today.slice(0, 7)) return first > today ? first : today;   // mese in corso: da oggi, ma mai prima del primo giorno attivo
+  return first;
+}
+
+const ddmm = (d) => (d ? `${String(d).slice(8, 10)}/${String(d).slice(5, 7)}` : '');
+
+// Richiesta Meta ancora da applicare (in attesa o programmata) per canale e mese, oppure null.
+function openRequest(state, channelId, ym) {
+  return state.requests
+    .filter(q => q.channel_id === channelId && q.ym === ym && (q.status === 'pending' || q.status === 'scheduled'))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+    .pop() || null;
+}
+
+function requestStatus(state, channelId, ym) {
+  const r = state.requests
+    .filter(q => q.channel_id === channelId && q.ym === ym && q.status !== 'superseded')
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+    .pop();
+  if (!r) return '';
+  if (r.status === 'pending') return `in attesa: ${r.eur} €/g`;
+  if (r.status === 'scheduled') return `su Meta dal ${ddmm(r.apply_from)}`;
+  if (r.status === 'applied') return `applicato il ${ddmm(r.updated_at || r.created_at)}`;
+  if (r.status === 'error') return `errore: ${r.result}`;
+  if (r.status === 'expired') return 'scaduta: il mese è finito prima di applicarla';
+  return r.status;
+}
+
+function prevMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`;
+}
+
+function nextMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+}
+
+export function buildDetail(state, meta, tab, ym, asOf, role, today = asOf) {
+  const s = state.structures.find(x => x.tab === tab);
+  const currentYm = asOf.slice(0, 7);
+  const channels = s.channels.map(ch => {
+    const v = channelView(state, meta, ch, ym, asOf, today);
+    let alert = null;
+    if (v && meta.as_of && ch.kind === 'meta' && ym === currentYm && v.programmed > 0 && v.remaining > 0 && v.eur > 0
+        && Math.abs(v.dailyBudget - v.eur) / v.eur > 0.10) {
+      alert = alertValues({ programmed: v.programmed, spent: v.spent, metaDailyBudget: v.dailyBudget,
+                            remaining: v.remaining, activeDays: v.win.days });
+    }
+    return { ...v, alert, applyFrom: v ? applyFrom(v.win, ym, asOf.slice(0, 10)) : null };
+  });
+
+  const sum = (xs, f) => xs.reduce((a, x) => a + (f(x) || 0), 0);
+  const metaCh = channels.filter(c => c.kind === 'meta');
+  const googleCh = channels.filter(c => c.kind === 'google');
+  const metaM = { spend: Math.round(sum(metaCh, c => c.spent) * 100) / 100, leads: sum(metaCh, c => sum(c.daily, d => d.leads)) };
+  const googleM = { spend: sum(googleCh, c => c.spent), leads: sum(googleCh, c => c.leadsMtd) };
+  // ChatGPT: la spesa entra nel totale, i clic restano a parte (non sono lead e falserebbero il costo per lead)
+  const clickM = (kind) => {
+    const xs = channels.filter(c => c.kind === kind);
+    return xs.length ? { spend: round2(sum(xs, c => c.spent)), clicks: sum(xs, c => c.leadsMtd) } : null;
+  };
+  const chatgptM = clickM('chatgpt');
+  const tiktokM = clickM('tiktok');   // TikTok (19/11): come ChatGPT, clic e non lead
+  const total = { spend: round2(metaM.spend + googleM.spend + (chatgptM ? chatgptM.spend : 0) + (tiktokM ? tiktokM.spend : 0)),
+                  leads: metaM.leads + googleM.leads };
+  total.cpl = total.leads > 0 ? Math.round((total.spend / total.leads) * 100) / 100 : null;
+
+  const yms = s.channels[0].months.map(m => m.ym);
+  const plan = yms.map(y => ({
+    ym: y,
+    channels: s.channels.map(ch => {
+      const months = withOverrides(state, ch);
+      const k = months.findIndex(x => x.ym === y);
+      const m = months[k];
+      // speso reale del mese: Meta dai dati giornalieri, Google dall'ultimo aggiornamento di Marco;
+      // fuori da quei dati vale la Spesa Effettiva dello Sheet; mesi futuri: nessun valore
+      let spent = null;
+      if (y <= today.slice(0, 7)) {
+        let computed = null;
+        if (ch.kind === 'meta') { const sp = metaSpent(meta, state.mapping, ch, y, asOf).spent; computed = sp > 0 ? sp : null; }
+        else { const g = latestGoogle(extRows(state, ch), ch.id, y); computed = g ? Number(g.spent_mtd) : null; }
+        spent = computed ?? m.sheet_spent ?? (y === today.slice(0, 7) ? 0 : null);
+      }
+      const programmed = (m.eur || 0) * (m.days || 0);
+      const row = { id: ch.id, kind: ch.kind, title: ch.title, eur: m.eur, days: m.days, proposal: m.proposal, start_day: m.start_day,
+               programmed, spent, spentPct: spent !== null && programmed > 0 ? Math.round((spent / programmed) * 100) : null,
+               requestStatus: ch.kind === 'meta' ? requestStatus(state, ch.id, y) : '',
+               win: activeWindow(months, k), startDayCustom: Boolean(m.start_day),
+               openRequest: ch.kind === 'meta' ? openRequest(state, ch.id, y) : null };
+      // richiesta programmata con una data che non torna piu' con Giorni / "dal giorno" (cambiati anche a mano nello Sheet)
+      const q = row.openRequest;
+      const due = q && q.status === 'scheduled' ? applyFrom(row.win, y, asOf.slice(0, 10)) : null;
+      row.requestStale = Boolean(due && q.apply_from !== due);
+      if (row.requestStale) row.requestStatus += ` · data da aggiornare: ora dal ${ddmm(due)}`;
+      return row;
+    }),
+    // note di quel mese (tutti gli autori), le più recenti prima: si vedono accanto al mese nel piano
+    notes: state.notes.filter(n => n.tab === tab && n.ym === y).sort((a, b) => String(b.ts).localeCompare(String(a.ts))),
+  }));
+
+  let closing = null;
+  const prevYm = prevMonth(ym);
+  if (yms.includes(prevYm)) {
+    const lastDay = `${prevYm}-31`;
+    const rows = s.channels.map((ch, k) => {
+      const p = channelView(state, meta, ch, prevYm, lastDay < asOf ? lastDay : asOf);
+      const n = channels[k];
+      if (!p || (p.programmed === 0 && p.spent === 0)) return null;
+      return { id: ch.id, kind: ch.kind, title: ch.title, programmed: p.programmed, spent: p.spent,
+               delta: Math.round(p.spent - p.programmed),
+               suggestion: closeSuggestion({ programmed: p.programmed, spent: p.spent, nextProgrammed: n.programmed,
+                                             nextDays: n.days || 0, nextEur: n.eur || 0 }) };
+    }).filter(Boolean);
+    closing = { prevYm, channels: rows };
+  }
+
+  const notes = { francesco: [], marco: [], ambra: [] };
+  for (const n of state.notes.filter(x => x.tab === tab && x.ym === ym).sort((a, b) => b.ts.localeCompare(a.ts))) {
+    if (notes[n.author]) notes[n.author].push(n);
+  }
+
+  return {
+    tab, ym, channels, plan, closing, notes,
+    totals: planTotals(plan),
+    prev: prevYearTotals(s),
+    results:{ month: { meta: metaM, google: googleM, chatgpt: chatgptM, ...(tiktokM ? { tiktok: tiktokM } : {}), total }, last7: buildCards({ ...state, structures: [s] }, meta, ym, asOf, today)[0].kpi7 },
+    can: { editMeta: role === 'francesco', editGoogle: role === 'marco', note: Boolean(role), propose: role === 'ambra' },
+  };
+}
+
+const pctOf = (part, whole) => (whole > 0 ? Math.round((part / whole) * 100) : null);
+
+// Totale del piano (tutti i mesi del foglio, ott 2026 – dic 2027): programmato e speso, per canale e in tutto.
+// upToYm: conta lo speso solo dei mesi fino a quello compreso (serve al report di un mese chiuso).
+export function planTotals(plan, upToYm = null) {
+  const channels = (plan[0]?.channels || []).map(c => ({ id: c.id, kind: c.kind, title: c.title, programmed: 0, spent: 0 }));
+  for (const p of plan) {
+    p.channels.forEach((c, k) => {
+      channels[k].programmed += c.programmed || 0;
+      if (c.spent !== null && c.spent !== undefined && (!upToYm || p.ym <= upToYm)) channels[k].spent += c.spent;
+    });
+  }
+  channels.forEach(c => { c.programmed = round2(c.programmed); c.spent = round2(c.spent); });
+  const programmed = round2(channels.reduce((a, c) => a + c.programmed, 0));
+  const spent = round2(channels.reduce((a, c) => a + c.spent, 0));
+  return {
+    from: plan[0]?.ym || null, to: plan.length ? plan[plan.length - 1].ym : null, channels,
+    total: { programmed, spent, remaining: round2(programmed - spent), pct: pctOf(spent, programmed) },
+  };
+}
+
+// Anno precedente: programmato e investito del blocco 2026 del vecchio foglio (righe 9-11 di ogni tab).
+export function prevYearTotals(structure) {
+  const channels = structure.channels
+    .filter(c => c.prev && ((c.prev.programmed || 0) > 0 || (c.prev.spent || 0) > 0))
+    .map(c => ({ id: c.id, kind: c.kind, title: c.title, year: c.prev.year, programmed: c.prev.programmed || 0, spent: c.prev.spent || 0 }));
+  if (!channels.length) return null;
+  const programmed = round2(channels.reduce((a, c) => a + c.programmed, 0));
+  const spent = round2(channels.reduce((a, c) => a + c.spent, 0));
+  return { year: channels[0].year, channels, total: { programmed, spent, pct: pctOf(spent, programmed) } };
+}
+
+// Stagione BeeFamily: da ottobre a settembre (Ambra, 25/11/2026). seasonStart('2026-11') = 2026 = ott 2026 – set 2027.
+export function seasonStart(ym) {
+  const y = Number(String(ym).slice(0, 4));
+  const m = Number(String(ym).slice(5, 7));
+  return m >= 10 ? y : y - 1;
+}
+
+const ymAdd = (ym, n) => {
+  const t = Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7)) - 1 + n;
+  return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`;
+};
+
+// Vecchio foglio budget (data/storico-2026.json, ottobre 2025 – dicembre 2026): somma dello speso dei canali della
+// struttura in un mese. Speso vuoto con un programmato = non registrato (null, non zero); vuoto senza niente di
+// programmato = 0; mese assente = null.
+function oldSpent(chans, titles, ym) {
+  let sum = null;
+  let planned = false;
+  let present = false;
+  for (const [title, months] of Object.entries(chans)) {
+    const v = titles.has(title) && months[ym];
+    if (!v) continue;
+    present = true;
+    if (v.spent !== null && v.spent !== undefined) sum = round2((sum || 0) + v.spent);
+    else if (v.programmed > 0) planned = true;
+  }
+  if (sum !== null) return sum;
+  return present && !planned ? 0 : null;
+}
+
+const storicoOf = (storico, structure) => (storico && storico.tabs && storico.tabs[structure.tab]) || null;
+
+// Anno precedente = stagione prima di quella del piano (piano da ottobre 2026 -> ottobre 2025 – settembre 2026),
+// mese per mese e per canale, tutto dal vecchio foglio. null se il vecchio foglio non ha la struttura.
+export function prevSeason(storico, structure, planStartYm) {
+  const chans = storicoOf(storico, structure);
+  if (!chans) return null;
+  const titles = new Set(structure.channels.map(c => c.title));
+  const from = `${seasonStart(planStartYm) - 1}-10`;
+  const yms = Array.from({ length: 12 }, (_, k) => ymAdd(from, k));
+  const months = yms.map(ym => ({ ym, spent: oldSpent(chans, titles, ym) }));
+  const total = months.reduce((a, m) => a + (m.spent || 0), 0);
+  months.forEach(m => { m.share = m.spent === null ? null : (total > 0 ? Math.round((m.spent / total) * 100) : 0); });
+  const channels = structure.channels.map(c => {
+    const ms = chans[c.title];
+    if (!ms) return null;
+    let programmed = 0;
+    let spent = 0;
+    for (const ym of yms) {
+      if (!ms[ym]) continue;
+      programmed += ms[ym].programmed || 0;
+      spent += ms[ym].spent || 0;
+    }
+    if (programmed <= 0 && spent <= 0) return null;
+    return { id: c.id, kind: c.kind, title: c.title, programmed: round2(programmed), spent: round2(spent), pct: pctOf(spent, programmed) };
+  }).filter(Boolean);
+  if (!channels.length && months.every(m => m.spent === null)) return null;
+  const tp = round2(channels.reduce((a, c) => a + c.programmed, 0));
+  const ts = round2(channels.reduce((a, c) => a + c.spent, 0));
+  return { from, to: yms[11], months, channels, total: { programmed: tp, spent: ts, pct: pctOf(ts, tp) } };
+}
+
+// Piano mese per mese: investito dello stesso mese dell'anno prima (vecchio foglio prima dell'inizio del piano,
+// poi lo speso del piano stesso) e scarto % del programmato di quest'anno. Per allineare subito i budget mensili.
+export function planVsLastYear(storico, structure, plan) {
+  const chans = storicoOf(storico, structure) || {};
+  const titles = new Set(structure.channels.map(c => c.title));
+  const start = plan[0].ym;
+  const spentOf = (p) => {
+    const vals = p.channels.map(c => c.spent).filter(v => v !== null && v !== undefined);
+    return vals.length ? round2(vals.reduce((a, v) => a + v, 0)) : null;
+  };
+  const out = {};
+  for (const p of plan) {
+    const prevYm = ymAdd(p.ym, -12);
+    let lastYear = null;
+    if (prevYm < start) lastYear = oldSpent(chans, titles, prevYm);
+    else {
+      const q = plan.find(x => x.ym === prevYm);
+      lastYear = q ? spentOf(q) : null;
+    }
+    const programmed = round2(p.channels.reduce((a, c) => a + (c.programmed || 0), 0));
+    out[p.ym] = { lastYear, pct: lastYear > 0 && programmed > 0 ? Math.round((programmed / lastYear - 1) * 100) : null };
+  }
+  return out;
+}
+
+// Date di aggiornamento: Meta dalla lettura automatica della notte, Google dall'ultimo inserimento di Marco.
+const dmyOf = (d) => `${d.slice(8, 10)}/${d.slice(5, 7)}/${d.slice(0, 4)}`;
+
+// Riga sotto il nome della struttura: data dell'ultimo aggiornamento in grassetto per ciascuna fonte.
+// kinds: i canali della struttura; senza, la riga classica Meta + Google.
+export function updateLineHtml(u, kinds = ['meta', 'google']) {
+  const parts = {
+    meta: u.meta ? `Meta aggiornato al <b>${dmyOf(u.meta)}</b> (automatico)` : 'Meta non ancora letto (automatico)',
+    google: u.google ? `Google aggiornato al <b>${dmyOf(u.google)}</b> (manuale)` : 'Google non ancora inserito da Marco (manuale)',
+    chatgpt: u.chatgpt ? `ChatGPT aggiornato al <b>${dmyOf(u.chatgpt)}</b> (automatico)` : 'ChatGPT non ancora letto (automatico)',
+    tiktok: u.tiktok ? `TikTok aggiornato al <b>${dmyOf(u.tiktok)}</b> (automatico)` : 'TikTok non ancora letto (automatico)',
+  };
+  return ['meta', 'google', 'chatgpt', 'tiktok'].filter(k => kinds.includes(k)).map(k => parts[k]).join(' · ');
+}
+
+export function updateDates(meta, state) {
+  const last = (rows) => (rows || []).map(g => String(g.date || '').slice(0, 10)).filter(Boolean).sort().pop() || null;
+  const out = { meta: (meta && meta.as_of) || null, google: last(state.google), chatgpt: last(state.chatgpt) };
+  if (state.tiktok) out.tiktok = last(state.tiktok);
+  return out;
+}
+
+// Report mensile per il cliente: solo speso del mese, programmato del mese dopo, speso sul totale del piano.
+export function buildReport(state, meta, tab, ym, asOf, today = asOf, names = null) {
+  const d = buildDetail(state, meta, tab, ym, asOf, null, today);
+  const k = d.plan.findIndex(p => p.ym === ym);
+  const row = d.plan[k];
+  const sum = (r, f) => round2(r.channels.reduce((a, c) => a + (f(c) || 0), 0));
+  let next = null;
+  const n = d.plan[k + 1];
+  if (n) {
+    const channels = n.channels.filter(c => c.programmed > 0)
+      .map(c => ({ kind: c.kind, title: c.title, eur: c.eur, days: c.win.days, programmed: c.programmed }));
+    const same = channels.length > 0 && channels.every(c => c.days === channels[0].days);
+    next = { ym: n.ym, programmed: sum(n, c => c.programmed), perDay: same ? round2(channels.reduce((a, c) => a + c.eur, 0)) : null,
+             days: same ? channels[0].days : null, channels };
+  }
+  const t = planTotals(d.plan, ym);
+  return {
+    tab, ...structureName(names, tab), asOf, from: t.from, to: t.to,
+    month: { ym, programmed: sum(row, c => c.programmed), spent: sum(row, c => c.spent), inProgress: ym >= today.slice(0, 7) },
+    next,
+    total: t.total,
+  };
+}
+
+// Account Meta non letti, solo se hanno campagne collegate a una scheda (es. Sardinia ha solo Google: niente avviso).
+export function staleAccounts(state, meta) {
+  // l'account e' collegato a una scheda dal roster (meta.accounts[id].tab); senza roster, dalla MAPPA
+  const metaTabs = new Set(state.structures.filter(s => s.channels.some(c => c.kind === 'meta')).map(s => s.tab));
+  const tabOf = new Map();
+  for (const r of state.mapping) {
+    if (!r.channel_id) continue;
+    const c = meta.campaigns.find(x => String(x.id) === String(r.campaign_id));
+    const acc = c ? c.account_id : String(r.account_id);
+    if (!tabOf.has(acc)) tabOf.set(acc, r.channel_id.split('|')[0]);
+  }
+  const nameOf = (id, a) => {
+    if (a.tab === 'COLOR') return [...metaTabs].some(t => t.startsWith('Color ')) ? 'Color Holiday' : null;
+    if (a.tab) return metaTabs.has(a.tab) ? a.tab : null;
+    return tabOf.get(id) || null;
+  };
+  return Object.entries(meta.accounts || {})
+    .filter(([, a]) => !a.ok)
+    .map(([id, a]) => ({ account_id: id, name: nameOf(id, a), last_ok: a.last_ok }))
+    .filter(x => x.name)
+    .sort((x, y) => x.name.localeCompare(y.name));
+}

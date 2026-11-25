@@ -1,0 +1,98 @@
+// Schermata gialla di caricamento (proposta B "Tag", 11/11/2026): firma spray che si disegna, frasi di attesa,
+// poi l'adesivo vola nella barra in alto. Scelta di Francesco dell'11/11: "5 secondi sempre", cioè compare
+// subito (è già visibile nell'HTML) e resta almeno 5 s anche se i dati arrivano prima; se tardano, resta fino
+// al loro arrivo. Solo alla prima apertura: i ricaricamenti dopo un salvataggio non la mostrano.
+
+import { greeting, romeHour, rememberedName } from './greeting.js';
+
+// Logica dei tempi, separata dal DOM per poterla provare in node. Con delay 0 la schermata parte subito.
+export function splashTimer({ show, hide, now, setTimer, clearTimer, delay = 0, minVisible = 5000 }) {
+  let timer = null;
+  let shownAt = null;
+  let ending = null;
+  return {
+    start() {
+      if (delay <= 0) { shownAt = now(); show(); return; }
+      timer = setTimer(() => { timer = null; shownAt = now(); show(); }, delay);
+    },
+    done() {
+      if (ending) return ending;
+      if (shownAt === null) {
+        if (timer !== null) clearTimer(timer);
+        timer = null;
+        ending = Promise.resolve();
+        return ending;
+      }
+      const wait = Math.max(0, minVisible - (now() - shownAt));
+      ending = new Promise((resolve) => setTimer(() => Promise.resolve(hide()).then(resolve, resolve), wait));
+      return ending;
+    },
+  };
+}
+
+const MESSAGES = ['Leggo il piano…', 'Conto la spesa di ieri…', 'Allineo Meta e Google…', 'Quasi fatto…'];
+
+function paintGreeting(el) {
+  if (!el) return;
+  let store = null;
+  try { store = localStorage; } catch { /* niente nome */ }
+  const g = greeting(romeHour(new Date()), rememberedName(store));
+  const emo = document.createElement('span');
+  emo.className = 'emo';
+  emo.setAttribute('aria-hidden', 'true');
+  emo.textContent = g.emoji;
+  el.textContent = `${g.text} `;
+  el.appendChild(emo);
+  el.classList.add('in');
+}
+const EXIT_MS = 450;
+
+export function startSplash() {
+  const el = document.getElementById('splash');
+  const body = document.body;
+  if (!el) return { done: () => Promise.resolve() };
+  const fly = el.querySelector('.splash-fly');
+  const msg = el.querySelector('.splash-msg');
+  const theme = document.querySelector('meta[name="theme-color"]');
+  const themeColor = theme ? theme.getAttribute('content') : null;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let cycle = null;
+
+  function show() {
+    let i = 0;
+    paintGreeting(el.querySelector('.splash-greet'));
+    msg.textContent = MESSAGES[0];
+    body.classList.add('splash-on', 'splash-mini-off');
+    el.hidden = false;
+    if (theme) theme.setAttribute('content', '#ffc400');
+    if (!reduced) cycle = setInterval(() => { i = Math.min(i + 1, MESSAGES.length - 1); msg.textContent = MESSAGES[i]; }, 1400);
+  }
+
+  function finish() {
+    el.hidden = true;
+    el.classList.remove('leaving');
+    fly.style.transform = '';
+    body.classList.remove('splash-on', 'splash-mini-off');
+  }
+
+  function hide() {
+    clearInterval(cycle);
+    if (theme && themeColor) theme.setAttribute('content', themeColor);
+    const target = document.querySelector('.topbar .rh-mini');
+    const to = target ? target.getBoundingClientRect() : null;
+    if (reduced || !to || !to.width) { finish(); return Promise.resolve(); }
+    const sticker = el.querySelector('.splash-sticker');
+    const from = sticker.getBoundingClientRect();
+    const dx = (to.left + to.width / 2) - (from.left + from.width / 2);
+    const dy = (to.top + to.height / 2) - (from.top + from.height / 2);
+    const scale = target.offsetWidth / sticker.offsetWidth;
+    body.classList.remove('splash-on'); // le card salgono mentre il giallo si scioglie
+    el.classList.add('leaving');
+    fly.style.transform = `translate(${dx}px, ${dy}px) scale(${scale}) rotate(3deg)`;
+    return new Promise((resolve) => setTimeout(() => { finish(); resolve(); }, EXIT_MS));
+  }
+
+  const t = splashTimer({ show, hide, now: () => performance.now(), setTimer: setTimeout, clearTimer: clearTimeout });
+  t.start();
+  return t;
+}
