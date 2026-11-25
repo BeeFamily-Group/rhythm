@@ -10,3 +10,12 @@ export function unpackLoad(r) {
   if (!r.state || r.state.ok === false) return { ok: false, invalid: false, error: (r.state && r.state.error) || 'stato non disponibile' };
   return { ok: true, role: r.role || null, state: r.state, meta: r.meta || emptyMeta(), storico: r.storico || null, names: r.names || null };
 }
+
+// Campi dello store dopo un caricamento: la data dei dati è quella di Meta, o ieri se Meta non ne ha ancora una.
+export function storeFields(d, now = new Date()) {
+  return {
+    state: d.state, meta: d.meta, storico: d.storico, names: d.names,
+    today: now.toLocaleDateString('sv-SE', { timeZone: 'Europe/Rome' }),
+    asOf: (d.meta && d.meta.as_of) || new Date(now.getTime() - 86400000).toISOString().slice(0, 10),
+  };
+}

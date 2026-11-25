@@ -1,6 +1,6 @@
 // Schermata principale: ricerca, mesi, andamento, schede per struttura, campagne da assegnare.
 import { load, isDemo } from './api.js';
-import { unpackLoad } from './session.js';
+import { unpackLoad, storeFields } from './session.js';
 import { buildCards, channelLabel, stateLabel, staleAccounts, staleText, macLate, trendDaily, matchQuery } from './viewmodel.js';
 import { fmtEur } from './calc.js';
 import { icon } from './icons.js';
@@ -125,12 +125,7 @@ async function openDetail(tab) {
 
 // Dati arrivati dalla web app (o dai file di prova in demo) dentro lo store.
 export function apply(d) {
-  store.state = d.state;
-  store.meta = d.meta;
-  store.storico = d.storico;
-  store.names = d.names;
-  store.today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Europe/Rome' });
-  store.asOf = meta.as_of || new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  Object.assign(store, storeFields(d));
   store.ym = store.ym || store.asOf.slice(0, 7);
 }
 
