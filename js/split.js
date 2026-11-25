@@ -18,7 +18,8 @@ export function monthRange(yms, from, to) {
 // Peso di ogni mese = quanto ha pesato lo stesso mese dell'anno prima sullo stesso canale.
 // Prima dell'inizio del piano: vecchio foglio, speso o (se manca, come ad agosto e settembre 2026) programmato.
 // Dal piano in poi: speso del piano o, se manca, programmato (€/giorno × giorni). null = nessun dato.
-export function lastYearWeights(storico, structure, plan, channelId, yms) {
+// Il mese in corso (nowYm) e quelli dopo pesano con il programmato: lo speso a metà mese non è l'anno prima.
+export function lastYearWeights(storico, structure, plan, channelId, yms, nowYm) {
   const start = plan[0].ym;
   const ch = structure.channels.find(c => c.id === channelId);
   const old = (storico && storico.tabs && storico.tabs[structure.tab] && ch && storico.tabs[structure.tab][ch.title]) || {};
@@ -33,12 +34,24 @@ export function lastYearWeights(storico, structure, plan, channelId, yms) {
     } else {
       const p = plan.find(x => x.ym === src);
       const c = p && p.channels.find(x => x.id === channelId);
-      if (c && c.spent !== null && c.spent !== undefined) w = c.spent;
-      else if (c && c.eur !== null && c.eur !== undefined) w = c.programmed;
+      const planned = c && c.eur !== null && c.eur !== undefined;
+      if (c && nowYm && src >= nowYm) w = planned ? c.programmed : null;
+      else if (c && c.spent !== null && c.spent !== undefined) w = c.spent;
+      else if (planned) w = c.programmed;
     }
     out[ym] = w;
   }
   return out;
+}
+
+// Ingresso di splitTotal dalle righe del piano: i giorni sono quelli per cui lo Sheet moltiplica il €/giorno
+// (0 o vuoto = nessun giorno attivo, anche se la finestra del mese ne mostra di più).
+export function splitInput(plan, channelId, range, weights) {
+  return range.map((ym) => {
+    const c = plan.find(p => p.ym === ym).channels.find(x => x.id === channelId);
+    const dim = c.win && c.win.daysInMonth ? c.win.daysInMonth : 31;
+    return { ym, days: c.days > 0 ? Math.min(c.days, dim) : 0, current: c.eur ?? null, weight: weights[ym] ?? null };
+  });
 }
 
 // months: [{ ym, days, current, weight }]. Le righe senza peso o senza giorni attivi restano fuori dalla somma.
@@ -49,7 +62,7 @@ export function splitTotal(total, months) {
   const rows = months.map((m) => {
     const base = { ym: m.ym, weight: m.weight ?? null, share: null, eur: null, amount: null, skip: null };
     if (m.weight === null || m.weight === undefined) return { ...base, skip: 'missing' };
-    if (!(m.days > 0)) return { ...base, share: Math.round((m.weight / sum) * 100), skip: 'nodays' };
+    if (!(m.days > 0)) return { ...base, skip: 'nodays' };   // fuori dalla somma: nessuna quota
     const eur = round2((total * m.weight) / sum / m.days);
     return { ...base, share: Math.round((m.weight / sum) * 100), eur, amount: round2(eur * m.days),
       skip: m.current !== null && m.current !== undefined && Number(m.current) === eur ? 'same' : null };

@@ -5,6 +5,7 @@ import { store, esc, ddmm, monthShort, monthLong, kpiHtml, barHtml, reload, rend
 import { post } from './api.js';
 import { icon } from './icons.js';
 import { mountTrend } from './trend.js';
+import { monthRange, lastYearWeights, splitTotal, splitInput } from './split.js';
 
 const $d = () => document.getElementById('detail');
 let currentTab = null;
@@ -273,10 +274,125 @@ function planBox(d, vs) {
     : d.can.propose
       ? 'Sui mesi dopo quello in corso puoi proporre €/giorno (Invio per salvare) e giorni: restano in giallo finché Francesco (Meta) o Marco (Google) non confermano, e solo allora arrivano alle campagne. Per il mese in corso la richiesta va su Asana.'
       : 'Speso: Meta dai dati giornalieri, Google dai numeri di Marco; per i mesi più vecchi vale la Spesa Effettiva dello Sheet.';
-  return `<div class="box"><div class="box-head"><div><h2>Piano mese per mese</h2><p class="small">${how}</p></div></div>
+  const split = d.can.propose ? '<button class="btn split-btn" type="button" data-act="split">Dividi un totale</button>' : '';   // solo Ambra (25/11)
+  return `<div class="box"><div class="box-head"><div><h2>Piano mese per mese</h2><p class="small">${how}</p></div>${split}</div>
       <div class="legend-row"><span><i class="prop" style="width:16px;height:12px;padding:0"></i>proposta da confermare</span><span>% = speso sul programmato · colorata a mese chiuso</span><span>Anno prima = investito dello stesso mese della stagione precedente, e quanto il programmato di quest'anno è sopra o sotto</span></div>
       <div class="scroll-x"><table class="t plan"><thead><tr><th rowspan="2">Mese</th>${head1}<th rowspan="2" class="status-h">Stato</th></tr><tr>${head2}</tr></thead>
       <tbody>${body}</tbody></table></div></div>`;
+}
+
+// Dividi un totale (richiesta di Ambra del 25/11): il totale di un canale nei mesi scelti, con le % dello stesso mese
+// dell'anno prima (js/split.js). Si salva un mese alla volta come proposta in giallo (savePlan, come a mano); se si
+// ferma a metà, «Riprova i mesi mancanti» riparte da lì.
+function splitDialog(d) {
+  const nowYm = todayRome().slice(0, 7);
+  const chans = d.plan[0].channels;
+  const months = d.plan.map(p => p.ym).filter(ym => ym > nowYm);
+  if (!months.length) { toast('Nel piano non ci sono mesi dopo quello in corso.'); return; }
+  const dlg = document.getElementById('dialog');
+  const start = months.includes('2027-01') ? '2027-01' : months[0];
+  const opts = (sel) => months.map(ym => `<option value="${ym}"${ym === sel ? ' selected' : ''}>${monthShort(ym)}</option>`).join('');
+  dlg.innerHTML = `<form class="dialog-card split-card" id="splitForm">
+      <h3>Dividi un totale</h3>
+      <p class="small">Il totale si divide nei mesi con le % dello stesso mese dell'anno prima. Ogni mese diventa una proposta in giallo, da confermare.</p>
+      <div class="split-grid">
+        <label>Canale<select id="spCh">${chans.map(c => `<option value="${esc(c.id)}">${esc(channelLabel(c.title))}</option>`).join('')}</select></label>
+        <label>Totale<input id="spTot" inputmode="decimal" autocomplete="off" placeholder="es. 15.000"></label>
+        <label>Da<select id="spFrom">${opts(start)}</select></label>
+        <label>A<select id="spTo">${opts(months[months.length - 1])}</select></label>
+      </div>
+      <div class="split-prev" id="spPrev"></div>
+      <p class="small" id="spMsg" role="status"></p>
+      <button class="btn primary" type="submit" id="spSave" disabled>Salva come proposte</button> <button class="btn" type="button" id="spClose">Annulla</button>
+    </form>`;
+  dlg.hidden = false;
+  const $ = (id) => dlg.querySelector(`#${id}`);
+  const fields = ['spCh', 'spTot', 'spFrom', 'spTo'].map($);
+  const saved = new Set();
+  let job = null;   // fissato al primo salvataggio: canale e mesi da scrivere
+
+  const compute = () => {
+    const id = $('spCh').value;
+    const range = monthRange(months, $('spFrom').value, $('spTo').value);
+    if (!range.length) return { ok: false, error: 'Il mese di inizio viene dopo la fine.' };
+    const weights = lastYearWeights(store.storico, structureOf(currentTab), d.plan, id, range, nowYm);
+    const input = splitInput(d.plan, id, range, weights);
+    const probe = splitTotal(1, input);   // anno prima mancante: si dice subito, anche senza totale
+    if (!probe.ok) return probe;
+    const total = parseEur($('spTot').value);
+    if (!(total > 0)) return { ok: false, error: '', rows: probe.rows.map(r => ({ ...r, eur: null, amount: null, skip: r.skip === 'missing' || r.skip === 'nodays' ? r.skip : 'wait' })) };
+    return { ...splitTotal(total, input), id, asked: total };
+  };
+
+  const proposal = (r) => {
+    if (saved.has(r.ym)) return `<b class="good">${eur2(r.eur)}/g · salvata</b>`;
+    if (r.skip === 'missing') return '<span class="dash">resta com\'è</span>';
+    if (r.skip === 'nodays') return '<span class="dash">nessun giorno attivo</span>';
+    if (r.skip === 'wait') return '<span class="dash">—</span>';
+    if (r.skip === 'same') return `${eur2(r.eur)}/g <span class="dash">già così</span>`;
+    return `<b>${eur2(r.eur)}/g</b> <span class="dash amt">= ${fmtEur(r.amount)}</span>`;
+  };
+
+  const paintPreview = () => {
+    const r = job ? job.result : compute();
+    const id = job ? job.result.id : $('spCh').value;
+    if (!job) $('spMsg').textContent = r.error || '';   // durante e dopo il salvataggio il messaggio è quello del giro
+    const rows = r.rows || [];
+    const cur = (ym) => d.plan.find(p => p.ym === ym).channels.find(x => x.id === id).eur;
+    $('spPrev').innerHTML = rows.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Mese</th><th>Anno prima</th><th>Oggi</th><th>Proposta</th></tr></thead><tbody>
+      ${rows.map(x => `<tr><td>${monthShort(x.ym)}</td><td>${x.weight === null ? '<span class="dash">—</span>' : `${fmtEur(x.weight)}${x.share === null ? '' : ` <span class="dash">· ${x.share}%</span>`}`}</td>
+        <td>${cur(x.ym) === null || cur(x.ym) === undefined ? '<span class="dash">—</span>' : `${eur2(cur(x.ym))}/g`}</td><td>${proposal(x)}</td></tr>`).join('')}
+      ${r.ok ? `<tr><td><b>Totale</b></td><td></td><td></td><td><b>${eur2(r.total)}</b>${Math.abs(r.total - r.asked) >= 0.01 ? ' <span class="dash amt">(centesimi al giorno arrotondati)</span>' : ''}</td></tr>` : ''}
+      </tbody></table></div>` : '';
+    const todo = r.ok ? r.rows.filter(x => x.skip === null && !saved.has(x.ym)) : [];
+    if (!job) {
+      $('spSave').disabled = !todo.length;
+      if (r.ok && !todo.length) $('spMsg').textContent = 'Niente da salvare: i mesi sono già così.';
+    }
+    return todo;
+  };
+
+  const close = () => {
+    dlg.hidden = true;
+    dlg.innerHTML = '';
+    if (saved.size) refreshAfter(`Proposte salvate: ${saved.size} ${saved.size === 1 ? 'mese' : 'mesi'} in giallo, da confermare.`);
+  };
+  fields.forEach(f => { f.addEventListener('input', paintPreview); f.addEventListener('change', paintPreview); });
+  // Invio nei campi non salva: nel resto della pagina Invio salva una cella, qui scriverebbe fino a 12 proposte
+  // prima di aver guardato l'anteprima. Si salva solo con il pulsante.
+  $('splitForm').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') e.preventDefault(); });
+  $('spClose').addEventListener('click', close);
+  $('splitForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!job) {
+      const result = compute();
+      if (!result.ok) return;
+      job = { result, total: result.rows.filter(x => x.skip === null).length };
+      fields.forEach(f => { f.disabled = true; });   // da qui canale, totale e mesi restano quelli del primo salvataggio
+    }
+    const todo = paintPreview();
+    const btn = $('spSave');
+    btn.disabled = true;
+    $('spClose').disabled = true;
+    let stop = null;
+    for (const x of todo) {
+      btn.textContent = `Salvo ${saved.size + 1} di ${job.total}…`;
+      const res = await post('savePlan', { channel_id: job.result.id, title: titleOf(job.result.id), ym: x.ym, eur: x.eur }, store.code)
+        .catch(err => ({ ok: false, error: err.message }));
+      if (!res.ok) { stop = { ym: x.ym, error: res.error || 'rete' }; break; }
+      saved.add(x.ym);
+      paintPreview();
+    }
+    $('spClose').disabled = false;
+    if (!stop) { close(); return; }
+    paintPreview();
+    $('spMsg').textContent = `Salvati ${saved.size} mesi su ${job.total}: si è fermato a ${monthShort(stop.ym)} (${stop.error}).`;
+    btn.textContent = 'Riprova i mesi mancanti';
+    btn.disabled = false;
+    $('spClose').textContent = 'Chiudi';
+  });
+  paintPreview();
+  $('spTot').focus();
 }
 
 function closingBox(d) {
@@ -408,6 +524,9 @@ async function onClick(e) {
         }
         await refreshAfter(msg);
       }
+    }
+    if (b.dataset.act === 'split') {
+      splitDialog(buildDetail(store.state, store.meta, currentTab, store.ym, store.asOf, store.role, todayRome()));
     }
     if (b.dataset.act === 'report') {
       // Google senza i numeri di Marco nel mese: il report mostrerebbe solo lo speso Meta. Si chiede prima.

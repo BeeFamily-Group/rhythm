@@ -333,6 +333,25 @@ textarea:focus { outline: 0; border-color: var(--focus); box-shadow: 0 0 0 3px v
 .dialog-card input:focus { outline: 0; border-color: var(--focus); box-shadow: 0 0 0 3px var(--ring); }
 .dialog-card label { display: block; margin: 10px 0; font-weight: 500; }
 .dialog-card .btn { margin: 8px 8px 0 0; }
+/* Dividi un totale (25/11): finestra più larga con l'anteprima mese per mese */
+.dialog-card.split-card { max-width: 620px; max-height: calc(100dvh - 32px); overflow-y: auto; }
+.split-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.split-grid label { margin: 6px 0; font-size: 13px; }
+.split-grid select, .split-grid input { display: block; width: 100%; height: 40px; margin-top: 4px; padding: 0 10px; border: 1px solid var(--line-2);
+  border-radius: var(--radius); font-size: 16px; background: var(--surface); }
+.split-grid select:focus { outline: 0; border-color: var(--focus); box-shadow: 0 0 0 3px var(--ring); }
+.split-prev { margin: 10px 0 4px; }
+.split-prev table.t td, .split-prev table.t th { padding: 7px 8px; }
+.split-btn { flex: none; }
+@media (max-width: 560px) {   /* da telefono: senza la colonna «Oggi», l'importo del mese sotto il €/giorno */
+  .dialog-card.split-card { padding: 18px 16px; }
+  .split-prev table.t { font-size: 12px; }
+  .split-prev table.t td, .split-prev table.t th { padding: 6px 5px; }
+  .split-prev table.t th:nth-child(3), .split-prev table.t td:nth-child(3) { display: none; }
+  .split-prev .amt { display: block; }
+  .split-prev table.t td:last-child { white-space: normal; }
+  .split-prev .scroll-x { overflow-x: visible; }
+}
 /* Codice come campo password (25/11): nome utente fisso fuori vista per il portachiavi, pulsante Mostra/Nascondi */
 .pw-user { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .dialog-card .pw { position: relative; margin-bottom: 4px; }
