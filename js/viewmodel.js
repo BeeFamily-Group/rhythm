@@ -11,6 +11,9 @@ export function channelLabel(title) {
   if (t.includes('GAS')) return `${base} GAS`;
   if (t.includes('VILLE')) return `${base} ville`;
   if (t.includes('BARCA')) return `${base} barca`;
+  if (t.includes('DACH')) return `${base} DACH`;           // Rivamare dal 26/11: Google per mercato estero
+  if (t.includes('ROMANIA')) return `${base} Romania`;
+  if (t.includes('UNGHERIA')) return `${base} Ungheria`;
   return base;
 }
 
